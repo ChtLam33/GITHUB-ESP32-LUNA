@@ -15,15 +15,18 @@
 #include <HTTPClient.h>
 #include <Update.h>
 
+// --- WiFiManager global (important pour le comportement robuste) ---
+WiFiManager wm;
+
 // --- Identifiant matériel unique (généré à partir du chip ID) ---
-String idCapteurStr;      // contiendra l'ID sous forme de String
+String idCapteurStr;            // contiendra l'ID sous forme de String
 const char* idCapteur = nullptr;  // pointeur vers les données de idCapteurStr
 
 // --- VERSION FIRMWARE (à incrémenter à chaque nouvelle release) ---
-const char* FIRMWARE_VERSION = "1.0.7";
+const char* FIRMWARE_VERSION = "1.0.8";
 
 // --- SERVEUR ---
-const char* server   = "prod.lamothe-despujols.com";
+const char* server    = "prod.lamothe-despujols.com";
 const int   httpsPort = 443;
 
 // --- CHEMINS OTA ---
@@ -51,9 +54,9 @@ const unsigned long otaCheckInterval = 600000UL; // 10 minutes
 
 int lastDistance = -1;
 
-// --- Retry auto Wi-Fi ---
-unsigned long lastWifiRetry       = 0;
-const unsigned long wifiRetryInterval = 60000UL; // tentative toutes les 60 s si déconnecté
+// --- Watchdog d’envoi (si plus d’envoi réussi pendant X ms → reboot) ---
+unsigned long lastSuccessfulSend     = 0;
+const unsigned long sendWatchdogDelay = 5UL * 60UL * 1000UL; // 5 minutes
 
 
 // --- TF-LUNA ---
@@ -62,7 +65,9 @@ uint8_t frameBuf[9];
 int frameIdx = 0;
 
 
-// === CONNEXION WIFI + WiFiManager ===
+// =====================================================
+// === CONNEXION WIFI + WiFiManager ROBUSTE          ===
+// =====================================================
 void setupWiFi() {
   pinMode(BOOT_PIN, INPUT_PULLUP);
   delay(200);
@@ -70,7 +75,7 @@ void setupWiFi() {
   Serial.println("\n🔌 Initialisation du Wi-Fi...");
   bool forceConfig = false;
 
-  // Si le bouton BOOT est maintenu au démarrage → mode config Wi-Fi
+  // Si le bouton BOOT est maintenu au démarrage → mode config Wi-Fi forcé
   unsigned long start = millis();
   while (millis() - start < 3000) {
     if (digitalRead(BOOT_PIN) == LOW) {
@@ -79,62 +84,54 @@ void setupWiFi() {
     }
   }
 
-  WiFiManager wm;
+  // Configuration WiFiManager
   wm.setDebugOutput(false);
-  wm.setTimeout(180);  // portail actif max 3 minutes (au-delà, il rend la main)
+  wm.setConnectTimeout(20);        // 20 s pour tenter le Wi-Fi connu
+  wm.setConfigPortalTimeout(180);  // 3 min pour saisir un nouveau Wi-Fi
+  wm.setBreakAfterConfig(true);    // rend la main au code après le portail
 
-  // --- Reconnexion automatique si Wi-Fi déjà connu ---
-  WiFi.persistent(true);
   WiFi.mode(WIFI_STA);
-  WiFi.begin();
 
-  int tries = 0;
-  // On passe de 20 tentatives (~10 s) à 60 tentatives (~30 s)
-  while (WiFi.status() != WL_CONNECTED && tries < 60) {
-    delay(500);
-    Serial.print(".");
-    tries++;
-  }
+  bool connected = false;
 
-  if (WiFi.status() == WL_CONNECTED && !forceConfig) {
-    Serial.println("\n✅ Reconnexion Wi-Fi réussie sans portail !");
+  if (forceConfig) {
+    Serial.println("⚙️ BOOT maintenu → reset des identifiants Wi-Fi + portail forcé.");
+    wm.resetSettings();  // on efface les anciens SSID/mots de passe
+    connected = wm.startConfigPortal("Cuve_Config_AP");
   } else {
-    Serial.println("\n⚙️ Démarrage du portail Wi-FiManager...");
-    if (forceConfig) {
-      // BOOT maintenu → on force le portail de config
-      if (!wm.startConfigPortal("Cuve_Config_AP")) {
-        Serial.println("❌ Échec de configuration Wi-Fi (portail forcé)");
-      }
-    } else {
-      // Tentative auto → si échec, on lance autoConnect puis portail si besoin
-      if (!wm.autoConnect("Cuve_Config_AP")) {
-        Serial.println("⚠️ Connexion Wi-Fi échouée, lancement AP config...");
-        wm.startConfigPortal("Cuve_Config_AP");
-      }
-    }
+    // autoConnect :
+    // 1) tente réseau enregistré pendant connectTimeout
+    // 2) si échec, ouvre automatiquement un portail de config
+    connected = wm.autoConnect("Cuve_Config_AP");
   }
 
-  // À ce stade, soit WiFiManager a trouvé un réseau, soit non
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.print("✅ Connecté au Wi-Fi : ");
-    Serial.println(WiFi.SSID());
-    Serial.print("Adresse IP : ");
-    Serial.println(WiFi.localIP());
-  } else {
-    Serial.println("❌ Toujours pas connecté au Wi-Fi après WiFiManager.");
+  if (!connected) {
+    Serial.println("❌ Impossible de se connecter au Wi-Fi (ni via portail). Redémarrage dans 5 s...");
+    delay(5000);
+    ESP.restart();
   }
+
+  Serial.print("✅ Connecté au Wi-Fi : ");
+  Serial.println(WiFi.SSID());
+  Serial.print("Adresse IP : ");
+  Serial.println(WiFi.localIP());
 
   Serial.print("Version firmware actuelle : ");
   Serial.println(FIRMWARE_VERSION);
+
+  // On initialise le watchdog d’envoi
+  lastSuccessfulSend = millis();
 }
 
 
 
-// === ENVOI DES DONNÉES ===
-void sendDataToServer(String jsonPayload) {
+// =====================================================
+// === ENVOI DES DONNÉES (retourne true si OK)       ===
+// =====================================================
+bool sendDataToServer(const String &jsonPayload) {
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("⚠️ Wi-Fi non connecté, envoi annulé");
-    return;
+    return false;
   }
 
   WiFiClientSecure client;
@@ -142,7 +139,7 @@ void sendDataToServer(String jsonPayload) {
 
   if (!client.connect(server, httpsPort)) {
     Serial.println("⚠️ Connexion HTTPS échouée (send)");
-    return;
+    return false;
   }
 
   String url = "/cuves/api_cuve.php";
@@ -158,6 +155,7 @@ void sendDataToServer(String jsonPayload) {
   Serial.println("➡️ Données envoyées au serveur :");
   Serial.println(jsonPayload);
 
+  // Lecture minimale de la réponse HTTP
   while (client.connected()) {
     String line = client.readStringUntil('\n');
     if (line == "\r") break;
@@ -165,9 +163,15 @@ void sendDataToServer(String jsonPayload) {
   String response = client.readString();
   Serial.println("Réponse serveur : " + response);
   client.stop();
+
+  // Si on est arrivé jusque-là, on considère l'envoi comme "réussi"
+  return true;
 }
 
-// === RÉCUPÉRATION CONFIG SERVEUR ===
+
+// =====================================================
+// === RÉCUPÉRATION CONFIG SERVEUR                  ===
+// =====================================================
 void checkConfigUpdate() {
   if (WiFi.status() != WL_CONNECTED) return;
 
@@ -214,7 +218,9 @@ void checkConfigUpdate() {
 }
 
 
-// === OTA : vérification et mise à jour ===
+// =====================================================
+// === OTA : vérification et mise à jour             ===
+// =====================================================
 void checkForOTAUpdate() {
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("OTA: Wi-Fi non connecté, skip");
@@ -347,7 +353,10 @@ void checkForOTAUpdate() {
   ESP.restart();
 }
 
-// === TF-LUNA ===
+
+// =====================================================
+// === TF-LUNA                                        ===
+// =====================================================
 bool validFrame(uint8_t *buf) {
   if (buf[0] != 0x59 || buf[1] != 0x59) return false;
   uint16_t sum = 0;
@@ -359,7 +368,10 @@ void processFrame(uint8_t *buf) {
   lastDistance = dist;
 }
 
-// === CALCUL DU VOLUME ===
+
+// =====================================================
+// === CALCUL DU VOLUME                               ===
+// =====================================================
 String buildStatusString(int distance, float &volumeCuveHL, float &capaciteCuveHL,
                          float &pourcentage, float &hauteurPlein, float &hauteurCuve) {
 
@@ -395,7 +407,9 @@ String buildStatusString(int distance, float &volumeCuveHL, float &capaciteCuveH
 }
 
 
-// === SETUP ===
+// =====================================================
+// === SETUP                                          ===
+// =====================================================
 void setup() {
   Serial.begin(115200);
   delay(300);
@@ -421,7 +435,7 @@ void setup() {
   // UART TF-Luna
   tfSerial.begin(115200, SERIAL_8N1, 16, 17);
 
-  // Wi-Fi
+  // Wi-Fi (gestion robuste)
   setupWiFi();
 
   // Récupération de la configuration serveur
@@ -432,10 +446,9 @@ void setup() {
 }
 
 
-
-
-
-// === LOOP ===
+// =====================================================
+// === LOOP                                           ===
+// =====================================================
 void loop() {
 
   // --- Lecture du TF-Luna ---
@@ -484,7 +497,10 @@ void loop() {
                     ",\"correction\":" + String(AjustementHL, 2) +
                     ",\"rssi\":" + String(rssi) + "}";
 
-      sendDataToServer(json);
+      bool ok = sendDataToServer(json);
+      if (ok) {
+        lastSuccessfulSend = now;  // on remet le watchdog à zéro
+      }
     }
   }
 
@@ -500,24 +516,12 @@ void loop() {
     checkForOTAUpdate();
   }
 
-  // ===================================================================
-  // === RETRY AUTOMATIQUE DU WIFI SI NON CONNECTÉ (toutes les 60 s) ===
-  // ===================================================================
-  if (WiFi.status() != WL_CONNECTED) {
-    if (now - lastWifiRetry >= wifiRetryInterval) {
-      lastWifiRetry = now;
-
-      Serial.println("🔁 Wi-Fi non connecté → tentative automatique...");
-
-      // Reset propre du Wi-Fi (important si routeur refuse temporairement)
-      WiFi.disconnect(true, true);
-      delay(200);
-
-      WiFi.mode(WIFI_STA);
-
-      // Relance avec les derniers identifiants sauvegardés par WiFiManager
-      WiFi.begin();
-    }
+  // ==========================================================
+  // === WATCHDOG : si plus d'envoi réussi pendant 5 minutes ===
+  // ==========================================================
+  if (millis() - lastSuccessfulSend > sendWatchdogDelay) {
+    Serial.println("⏱️ Plus de 5 minutes sans envoi réussi → redémarrage pour forcer une reconnexion Wi-Fi...");
+    delay(500);
+    ESP.restart();
   }
 }
-
