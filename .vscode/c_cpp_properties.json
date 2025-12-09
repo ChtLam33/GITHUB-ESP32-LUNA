@@ -4,25 +4,26 @@
       "name": "Linux",
       "includePath": [
         "${workspaceFolder}/**",
-        "${env:HOME}/.arduino15/packages/esp32/hardware/esp32/3.3.3/cores/esp32",
-        "${env:HOME}/.arduino15/packages/esp32/hardware/esp32/3.3.3/variants/esp32",
-        "${env:HOME}/.arduino15/packages/esp32/hardware/esp32/3.3.3/libraries/WiFi/src",
-        "${env:HOME}/.arduino15/packages/esp32/hardware/esp32/3.3.3/libraries/HTTPClient/src",
-        "${env:HOME}/.arduino15/packages/esp32/hardware/esp32/3.3.3/libraries/Update/src",
-        "${env:HOME}/Arduino/libraries/ArduinoJson/src",
-        "${env:HOME}/Arduino/libraries/WiFiManager/src",
-        "${env:HOME}/Arduino/libraries/TFMini/src"
+        "${workspaceFolder}/../.arduino15/packages/esp32/hardware/esp32/3.3.3/**",
+        "${workspaceFolder}/../Arduino/libraries/**"
       ],
       "defines": [
         "ARDUINO=10800",
         "ARDUINO_ESP32",
-        "ESP32",
-        "CORE_DEBUG_LEVEL=0"
+        "ESP32"
       ],
       "compilerPath": "/usr/bin/gcc",
       "cStandard": "c99",
       "cppStandard": "c++11",
-      "intelliSenseMode": "linux-gcc-arm"
+      "intelliSenseMode": "linux-gcc-arm",
+      "browse": {
+        "path": [
+          "${workspaceFolder}",
+          "${workspaceFolder}/../.arduino15/packages/esp32/hardware/esp32/3.3.3",
+          "${workspaceFolder}/../Arduino/libraries"
+        ],
+        "limitSymbolsToIncludedHeaders": true
+      }
     }
   ],
   "version": 4
