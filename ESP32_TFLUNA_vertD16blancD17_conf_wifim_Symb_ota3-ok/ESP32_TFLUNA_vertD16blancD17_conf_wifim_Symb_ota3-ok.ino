@@ -23,7 +23,7 @@ String idCapteurStr;            // contiendra l'ID sous forme de String
 const char* idCapteur = nullptr;  // pointeur vers les données de idCapteurStr
 
 // --- VERSION FIRMWARE (à incrémenter à chaque nouvelle release) ---
-const char* FIRMWARE_VERSION = "1.0.8";
+const char* FIRMWARE_VERSION = "1.1.8";
 
 // --- SERVEUR ---
 const char* server    = "prod.lamothe-despujols.com";
