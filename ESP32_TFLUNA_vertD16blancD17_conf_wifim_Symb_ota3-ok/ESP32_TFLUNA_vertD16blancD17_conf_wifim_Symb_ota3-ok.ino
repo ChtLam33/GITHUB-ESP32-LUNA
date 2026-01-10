@@ -1,7 +1,7 @@
 /* ESP32 + TF-Luna (UART2 D16 RX / D17 TX)
    Firmware ESP32 — Capteur cuve — v1.2.2
 
-   Objectif v1.1.9 (simple & robuste, sans casser OTA) :
+   Objectif version :
    - Désynchronisation AU DÉMARRAGE (anti tempête Freebox / DHCP / TLS)
    - Wi-Fi plus stable (auto-reconnect + pas d’écriture flash)
    - Petit jitter sur les ENVOIS uniquement (évite re-synchronisation dans le temps)
@@ -452,7 +452,7 @@ void setup() {
   // Timers
   lastNotifyMillis = millis();
   lastConfigCheck  = millis();
-  lastOtaCheck     = millis();
+  //lastOtaCheck     = millis(); mise à jour OTA seulement au démarrage
 }
 
 // =====================================================
