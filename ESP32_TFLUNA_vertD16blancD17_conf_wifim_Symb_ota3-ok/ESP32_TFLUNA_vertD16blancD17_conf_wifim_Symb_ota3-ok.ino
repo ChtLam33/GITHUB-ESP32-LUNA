@@ -1,10 +1,16 @@
 /* ESP32 + TF-Luna (UART2 D16 RX / D17 TX)
-   Lecture robuste, calcul volume, envoi JSON HTTPS,
-   récupération auto de la config (get_config.php) toutes les 60s,
-   configuration Wi-Fi locale via WiFiManager (appui long sur BOOT),
-   sauvegarde du dernier Wi-Fi connu (persistant après coupure),
-   indicateur de qualité Wi-Fi (RSSI),
-   ET OTA HTTPS centralisé via ota_check.php.
+   Firmware ESP32 — Capteur cuve — v1.1.9
+
+   Objectif v1.1.9 (simple & robuste, sans casser OTA) :
+   - Désynchronisation AU DÉMARRAGE (anti tempête Freebox / DHCP / TLS)
+   - Wi-Fi plus stable (auto-reconnect + pas d’écriture flash)
+   - Petit jitter sur les ENVOIS uniquement (évite re-synchronisation dans le temps)
+   - OTA / Config : inchangés dans leur logique
+
+   IMPORTANT :
+   - OTA continue de fonctionner via ota_check.php
+   - Le JSON envoyé conserve : correction, hauteurPlein, hauteurCuve
+   - (Optionnel) fw est envoyé au serveur si ton api_cuve.php le gère
 */
 
 #include <Arduino.h>
@@ -15,15 +21,15 @@
 #include <HTTPClient.h>
 #include <Update.h>
 
-// --- WiFiManager global (important pour le comportement robuste) ---
+// --- WiFiManager global ---
 WiFiManager wm;
 
-// --- Identifiant matériel unique (généré à partir du chip ID) ---
-String idCapteurStr;            // contiendra l'ID sous forme de String
-const char* idCapteur = nullptr;  // pointeur vers les données de idCapteurStr
+// --- Identifiant matériel unique ---
+String idCapteurStr;
+const char* idCapteur = nullptr;
 
-// --- VERSION FIRMWARE (à incrémenter à chaque nouvelle release) ---
-const char* FIRMWARE_VERSION = "1.1.8";
+// --- VERSION FIRMWARE ---
+const char* FIRMWARE_VERSION = "1.1.9";
 
 // --- SERVEUR ---
 const char* server    = "prod.lamothe-despujols.com";
@@ -33,7 +39,7 @@ const int   httpsPort = 443;
 const char* otaCheckPath = "/cuves/ota_check.php"; // renvoie JSON version + url
 
 // --- BROCHE DU BOUTON BOOT ---
-#define BOOT_PIN 0  // sur les ESP32 classiques, le bouton BOOT = GPIO0
+#define BOOT_PIN 0  // sur ESP32 classique, bouton BOOT = GPIO0
 
 // --- VARIABLES DE CUVE ---
 String nomCuve = "";   // pas de valeur par défaut
@@ -44,26 +50,28 @@ float AjustementHL       = 0.00;
 
 // --- TEMPO ---
 unsigned long lastNotifyMillis   = 0;
-const unsigned long intervalMs   = 8000UL; // mesure luna toutes les 8 secondes 
+const unsigned long intervalMs   = 8000UL; // mesure luna toutes les 8 secondes
 unsigned long lastConfigCheck    = 0;
 const unsigned long configCheckInterval = 60000UL;
 
-// --- OTA TEMPO (par ex. toutes les 10 minutes) ---
+// --- OTA TEMPO ---
 unsigned long lastOtaCheck       = 0;
 const unsigned long otaCheckInterval = 600000UL; // 10 minutes
 
 int lastDistance = -1;
 
-// --- Watchdog d’envoi (si plus d’envoi réussi pendant X ms → reboot) ---
-unsigned long lastSuccessfulSend     = 0;
+// --- Watchdog d’envoi ---
+unsigned long lastSuccessfulSend      = 0;
 const unsigned long sendWatchdogDelay = 5UL * 60UL * 1000UL; // 5 minutes
-
 
 // --- TF-LUNA ---
 HardwareSerial tfSerial(2); // UART2 (D16 RX / D17 TX)
 uint8_t frameBuf[9];
 int frameIdx = 0;
 
+// --- Anti tempête Freebox : désynchro + jitter (simple) ---
+static const unsigned long START_DELAY_MAX_MS = 20000UL; // 0..20s au boot
+static const unsigned long SEND_JITTER_MAX_MS = 2000UL;  // 0..2s après chaque envoi
 
 // =====================================================
 // === CONNEXION WIFI + WiFiManager ROBUSTE          ===
@@ -86,22 +94,23 @@ void setupWiFi() {
 
   // Configuration WiFiManager
   wm.setDebugOutput(false);
-  wm.setConnectTimeout(20);        // 20 s pour tenter le Wi-Fi connu
-  wm.setConfigPortalTimeout(180);  // 3 min pour saisir un nouveau Wi-Fi
-  wm.setBreakAfterConfig(true);    // rend la main au code après le portail
+  wm.setConnectTimeout(20);
+  wm.setConfigPortalTimeout(180);
+  wm.setBreakAfterConfig(true);
 
   WiFi.mode(WIFI_STA);
+
+  // ✅ v1.1.9 : Wi-Fi plus stable / évite écritures flash inutiles
+  WiFi.setAutoReconnect(true);
+  WiFi.persistent(false);
 
   bool connected = false;
 
   if (forceConfig) {
     Serial.println("⚙️ BOOT maintenu → reset des identifiants Wi-Fi + portail forcé.");
-    wm.resetSettings();  // on efface les anciens SSID/mots de passe
+    wm.resetSettings();
     connected = wm.startConfigPortal("Cuve_Config_AP");
   } else {
-    // autoConnect :
-    // 1) tente réseau enregistré pendant connectTimeout
-    // 2) si échec, ouvre automatiquement un portail de config
     connected = wm.autoConnect("Cuve_Config_AP");
   }
 
@@ -119,11 +128,8 @@ void setupWiFi() {
   Serial.print("Version firmware actuelle : ");
   Serial.println(FIRMWARE_VERSION);
 
-  // On initialise le watchdog d’envoi
   lastSuccessfulSend = millis();
 }
-
-
 
 // =====================================================
 // === ENVOI DES DONNÉES (retourne true si OK)       ===
@@ -152,9 +158,6 @@ bool sendDataToServer(const String &jsonPayload) {
   client.println();
   client.print(jsonPayload);
 
-  Serial.println("➡️ Données envoyées au serveur :");
-  Serial.println(jsonPayload);
-
   // Lecture minimale de la réponse HTTP
   while (client.connected()) {
     String line = client.readStringUntil('\n');
@@ -164,10 +167,8 @@ bool sendDataToServer(const String &jsonPayload) {
   Serial.println("Réponse serveur : " + response);
   client.stop();
 
-  // Si on est arrivé jusque-là, on considère l'envoi comme "réussi"
   return true;
 }
-
 
 // =====================================================
 // === RÉCUPÉRATION CONFIG SERVEUR                  ===
@@ -216,7 +217,6 @@ void checkConfigUpdate() {
 
   Serial.println("Config appliquée depuis serveur.");
 }
-
 
 // =====================================================
 // === OTA : vérification et mise à jour             ===
@@ -353,9 +353,8 @@ void checkForOTAUpdate() {
   ESP.restart();
 }
 
-
 // =====================================================
-// === TF-LUNA                                        ===
+// === TF-LUNA                                       ===
 // =====================================================
 bool validFrame(uint8_t *buf) {
   if (buf[0] != 0x59 || buf[1] != 0x59) return false;
@@ -363,11 +362,11 @@ bool validFrame(uint8_t *buf) {
   for (int i = 0; i < 8; ++i) sum += buf[i];
   return (uint8_t)(sum & 0xFF) == buf[8];
 }
+
 void processFrame(uint8_t *buf) {
   int dist = buf[2] + (buf[3] << 8);
   lastDistance = dist;
 }
-
 
 // =====================================================
 // === CALCUL DU VOLUME                               ===
@@ -406,7 +405,6 @@ String buildStatusString(int distance, float &volumeCuveHL, float &capaciteCuveH
   return String(buf);
 }
 
-
 // =====================================================
 // === SETUP                                          ===
 // =====================================================
@@ -416,18 +414,17 @@ void setup() {
   Serial.println("\n--- TF-Luna + WiFiManager + AutoConfig + RSSI + OTA ---");
 
   // === ID MATÉRIEL UNIQUE (44 bits → 11 caractères hex) ===
-  uint64_t chipid  = ESP.getEfuseMac();                  // 48 bits uniques par ESP32
-  uint64_t shortId = (chipid & 0xFFFFFFFFFFFULL);        // On garde 44 bits → 11 hex
+  uint64_t chipid  = ESP.getEfuseMac();
+  uint64_t shortId = (chipid & 0xFFFFFFFFFFFULL);
 
-  char buf[16];  // 11 caractères hex + null terminator + marge
-  snprintf(buf, sizeof(buf), "%011llX", (unsigned long long)shortId);  // Exemple : "03FA91C2B7D"
+  char buf[16];
+  snprintf(buf, sizeof(buf), "%011llX", (unsigned long long)shortId);
 
   idCapteurStr = String(buf);
   idCapteur    = idCapteurStr.c_str();
 
   Serial.print("ID capteur matériel : ");
   Serial.println(idCapteur);
-  // =======================================================
 
   // IMPORTANT : nomCuve doit être vide au démarrage
   nomCuve = "";
@@ -435,16 +432,28 @@ void setup() {
   // UART TF-Luna
   tfSerial.begin(115200, SERIAL_8N1, 16, 17);
 
-  // Wi-Fi (gestion robuste)
+  // ✅ v1.1.9 : Désynchronisation au démarrage (anti tempête Freebox)
+  randomSeed((unsigned long)ESP.getEfuseMac());
+  unsigned long startDelay = random(0UL, START_DELAY_MAX_MS + 1UL);
+  Serial.print("⏳ Délai de démarrage aléatoire: ");
+  Serial.print(startDelay);
+  Serial.println(" ms");
+  delay(startDelay);
+
+  // Wi-Fi
   setupWiFi();
 
-  // Récupération de la configuration serveur
+  // Config serveur
   checkConfigUpdate();
 
-  // Vérification OTA au démarrage
+  // OTA au démarrage
   checkForOTAUpdate();
-}
 
+  // Timers
+  lastNotifyMillis = millis();
+  lastConfigCheck  = millis();
+  lastOtaCheck     = millis();
+}
 
 // =====================================================
 // === LOOP                                           ===
@@ -475,7 +484,8 @@ void loop() {
 
   // --- Envoi périodique ---
   if (now - lastNotifyMillis >= intervalMs) {
-    lastNotifyMillis = now;
+    // ✅ v1.1.9 : petit jitter après chaque cycle d’envoi (anti re-synchro)
+    lastNotifyMillis = now + random(0UL, SEND_JITTER_MAX_MS + 1UL);
 
     if (lastDistance > 0) {
       float volumeCuveHL, capaciteCuveHL, pourcentage, hauteurPlein, hauteurCuve;
@@ -486,20 +496,23 @@ void loop() {
       Serial.println(payloadText);
 
       int rssi = WiFi.RSSI();
+
+      // JSON attendu par api_cuve.php (+ fw optionnel)
       String json = String("{\"id\":\"") + idCapteur +
                     "\",\"cuve\":\"" + nomCuve +
                     "\",\"distance\":" + String(lastDistance) +
                     ",\"volume\":" + String(volumeCuveHL, 2) +
                     ",\"capacite\":" + String(capaciteCuveHL, 2) +
                     ",\"pourcentage\":" + String(pourcentage, 2) +
-                    ",\"hauteurPlein\":" + String(hauteurPlein) +
-                    ",\"hauteurCuve\":" + String(hauteurCuve) +
+                    ",\"hauteurPlein\":" + String(hauteurPlein, 1) +
+                    ",\"hauteurCuve\":" + String(hauteurCuve, 1) +
                     ",\"correction\":" + String(AjustementHL, 2) +
-                    ",\"rssi\":" + String(rssi) + "}";
+                    ",\"rssi\":" + String(rssi) +
+                    ",\"fw\":\"" + String(FIRMWARE_VERSION) + "\"}";
 
       bool ok = sendDataToServer(json);
       if (ok) {
-        lastSuccessfulSend = now;  // on remet le watchdog à zéro
+        lastSuccessfulSend = now;
       }
     }
   }
@@ -516,11 +529,9 @@ void loop() {
     checkForOTAUpdate();
   }
 
-  // ==========================================================
-  // === WATCHDOG : si plus d'envoi réussi pendant 5 minutes ===
-  // ==========================================================
+  // --- WATCHDOG : si plus d'envoi réussi pendant 5 minutes ---
   if (millis() - lastSuccessfulSend > sendWatchdogDelay) {
-    Serial.println("⏱️ Plus de 5 minutes sans envoi réussi → redémarrage pour forcer une reconnexion Wi-Fi...");
+    Serial.println("⏱️ Plus de 5 minutes sans envoi réussi → redémarrage pour forcer reconnexion Wi-Fi...");
     delay(500);
     ESP.restart();
   }
