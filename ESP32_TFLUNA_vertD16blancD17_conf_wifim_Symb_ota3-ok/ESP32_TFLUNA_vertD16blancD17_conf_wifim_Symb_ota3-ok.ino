@@ -1,5 +1,5 @@
 /* ESP32 + TF-Luna (UART2 D16 RX / D17 TX)
-   Firmware ESP32 — Capteur cuve — v1.1.9
+   Firmware ESP32 — Capteur cuve — v1.2.1
 
    Objectif v1.1.9 (simple & robuste, sans casser OTA) :
    - Désynchronisation AU DÉMARRAGE (anti tempête Freebox / DHCP / TLS)
@@ -56,7 +56,7 @@ const unsigned long configCheckInterval = 60000UL;
 
 // --- OTA TEMPO ---
 unsigned long lastOtaCheck       = 0;
-const unsigned long otaCheckInterval = 600000UL; // 10 minutes
+const unsigned long otaCheckInterval = 180000UL; // 3 minutes
 
 int lastDistance = -1;
 
