@@ -54,9 +54,9 @@ const unsigned long intervalMs   = 8000UL; // mesure luna toutes les 8 secondes
 unsigned long lastConfigCheck    = 0;
 const unsigned long configCheckInterval = 60000UL;
 
-// --- OTA TEMPO ---
-unsigned long lastOtaCheck       = 0;
-const unsigned long otaCheckInterval = 180000UL; // 3 minutes
+// --- OTA TEMPO --- mise à jour OTA seulement au démarrage.
+//unsigned long lastOtaCheck       = 0;
+//const unsigned long otaCheckInterval = 180000UL; // 3 minutes
 
 int lastDistance = -1;
 
@@ -523,11 +523,11 @@ void loop() {
     checkConfigUpdate();
   }
 
-  // --- Vérifie OTA toutes les 10 minutes ---
-  if (now - lastOtaCheck >= otaCheckInterval) {
-    lastOtaCheck = now;
-    checkForOTAUpdate();
-  }
+  // --- Vérifie OTA toutes les x minutes --- mise à jour OTA seulement au démarrage
+  //if (now - lastOtaCheck >= otaCheckInterval) {
+  //  lastOtaCheck = now;
+  //  checkForOTAUpdate();
+  //}
 
   // --- WATCHDOG : si plus d'envoi réussi pendant 5 minutes ---
   if (millis() - lastSuccessfulSend > sendWatchdogDelay) {
