@@ -1,5 +1,5 @@
 /* ESP32 + TF-Luna (UART2 D16 RX / D17 TX)
-   Firmware ESP32 — Capteur cuve — v1.2.1
+   Firmware ESP32 — Capteur cuve — v1.2.2
 
    Objectif v1.1.9 (simple & robuste, sans casser OTA) :
    - Désynchronisation AU DÉMARRAGE (anti tempête Freebox / DHCP / TLS)
@@ -29,7 +29,7 @@ String idCapteurStr;
 const char* idCapteur = nullptr;
 
 // --- VERSION FIRMWARE ---
-const char* FIRMWARE_VERSION = "1.2.1";
+const char* FIRMWARE_VERSION = "1.2.2";
 
 // --- SERVEUR ---
 const char* server    = "prod.lamothe-despujols.com";
