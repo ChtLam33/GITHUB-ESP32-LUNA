@@ -29,7 +29,7 @@ String idCapteurStr;
 const char* idCapteur = nullptr;
 
 // --- VERSION FIRMWARE ---
-const char* FIRMWARE_VERSION = "1.1.9";
+const char* FIRMWARE_VERSION = "1.2.1";
 
 // --- SERVEUR ---
 const char* server    = "prod.lamothe-despujols.com";
