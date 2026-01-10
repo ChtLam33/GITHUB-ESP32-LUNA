@@ -1,16 +1,12 @@
 /* ESP32 + TF-Luna (UART2 D16 RX / D17 TX)
-   Firmware ESP32 — Capteur cuve — v1.2.2
+   Firmware ESP32 — Capteur cuve — v1.2.3
 
    Objectif version :
    - Désynchronisation AU DÉMARRAGE (anti tempête Freebox / DHCP / TLS)
    - Wi-Fi plus stable (auto-reconnect + pas d’écriture flash)
    - Petit jitter sur les ENVOIS uniquement (évite re-synchronisation dans le temps)
    - OTA / Config : inchangés dans leur logique
-
-   IMPORTANT :
-   - OTA continue de fonctionner via ota_check.php
-   - Le JSON envoyé conserve : correction, hauteurPlein, hauteurCuve
-   - (Optionnel) fw est envoyé au serveur si ton api_cuve.php le gère
+   - FIX IMPORTANT : OTA uniquement si version distante STRICTEMENT supérieure à la version locale
 */
 
 #include <Arduino.h>
@@ -29,7 +25,7 @@ String idCapteurStr;
 const char* idCapteur = nullptr;
 
 // --- VERSION FIRMWARE ---
-const char* FIRMWARE_VERSION = "1.2.2";
+const char* FIRMWARE_VERSION = "1.2.3";
 
 // --- SERVEUR ---
 const char* server    = "prod.lamothe-despujols.com";
@@ -73,6 +69,55 @@ int frameIdx = 0;
 static const unsigned long START_DELAY_MAX_MS = 20000UL; // 0..20s au boot
 static const unsigned long SEND_JITTER_MAX_MS = 2000UL;  // 0..2s après chaque envoi
 
+
+// =====================================================
+// === OUTILS : comparaison de versions "x.y.z"      ===
+// =====================================================
+
+// Parse "1.2.3" -> a,b,c. Retourne false si format invalide.
+bool parseSemver3(const String& s, int &a, int &b, int &c) {
+  a = b = c = 0;
+
+  String t = s;
+  t.trim();
+  if (t.length() == 0) return false;
+
+  int p1 = t.indexOf('.');
+  if (p1 < 0) return false;
+  int p2 = t.indexOf('.', p1 + 1);
+  if (p2 < 0) return false;
+
+  String sa = t.substring(0, p1);
+  String sb = t.substring(p1 + 1, p2);
+  String sc = t.substring(p2 + 1);
+
+  sa.trim(); sb.trim(); sc.trim();
+  if (sa.length() == 0 || sb.length() == 0 || sc.length() == 0) return false;
+
+  // Vérif chiffres uniquement (évite "1.2.3-beta")
+  for (size_t i = 0; i < sa.length(); i++) if (!isDigit(sa[i])) return false;
+  for (size_t i = 0; i < sb.length(); i++) if (!isDigit(sb[i])) return false;
+  for (size_t i = 0; i < sc.length(); i++) if (!isDigit(sc[i])) return false;
+
+  a = sa.toInt();
+  b = sb.toInt();
+  c = sc.toInt();
+  return true;
+}
+
+// Retourne 1 si vA > vB, 0 si égal, -1 si vA < vB, et -2 si invalide
+int compareSemver3(const String& vA, const String& vB) {
+  int a1,b1,c1, a2,b2,c2;
+  if (!parseSemver3(vA, a1,b1,c1)) return -2;
+  if (!parseSemver3(vB, a2,b2,c2)) return -2;
+
+  if (a1 != a2) return (a1 > a2) ? 1 : -1;
+  if (b1 != b2) return (b1 > b2) ? 1 : -1;
+  if (c1 != c2) return (c1 > c2) ? 1 : -1;
+  return 0;
+}
+
+
 // =====================================================
 // === CONNEXION WIFI + WiFiManager ROBUSTE          ===
 // =====================================================
@@ -100,7 +145,7 @@ void setupWiFi() {
 
   WiFi.mode(WIFI_STA);
 
-  // ✅ v1.1.9 : Wi-Fi plus stable / évite écritures flash inutiles
+  // Wi-Fi plus stable / évite écritures flash inutiles
   WiFi.setAutoReconnect(true);
   WiFi.persistent(false);
 
@@ -130,6 +175,7 @@ void setupWiFi() {
 
   lastSuccessfulSend = millis();
 }
+
 
 // =====================================================
 // === ENVOI DES DONNÉES (retourne true si OK)       ===
@@ -169,6 +215,7 @@ bool sendDataToServer(const String &jsonPayload) {
 
   return true;
 }
+
 
 // =====================================================
 // === RÉCUPÉRATION CONFIG SERVEUR                  ===
@@ -217,6 +264,7 @@ void checkConfigUpdate() {
 
   Serial.println("Config appliquée depuis serveur.");
 }
+
 
 // =====================================================
 // === OTA : vérification et mise à jour             ===
@@ -270,10 +318,13 @@ void checkForOTAUpdate() {
     return;
   }
 
-  const char* newVersion = doc["version"] | "";
-  String fwUrl           = doc["url"] | "";
+  const char* newVersionC = doc["version"] | "";
+  String fwUrl            = doc["url"] | "";
 
-  if (strlen(newVersion) == 0 || fwUrl.length() == 0) {
+  String newVersion = String(newVersionC);
+  newVersion.trim();
+
+  if (newVersion.length() == 0 || fwUrl.length() == 0) {
     Serial.println("⚠️ OTA: champs 'version' ou 'url' manquants");
     return;
   }
@@ -283,12 +334,18 @@ void checkForOTAUpdate() {
   Serial.print("OTA: version locale   = ");
   Serial.println(FIRMWARE_VERSION);
 
-  if (String(newVersion) == String(FIRMWARE_VERSION)) {
-    Serial.println("OTA: firmware déjà à jour.");
+  // ✅ FIX v1.2.3 : OTA uniquement si distante STRICTEMENT supérieure
+  int cmp = compareSemver3(newVersion, String(FIRMWARE_VERSION));
+  if (cmp == -2) {
+    Serial.println("⚠️ OTA: format de version invalide (attendu x.y.z). OTA annulée.");
+    return;
+  }
+  if (cmp <= 0) {
+    Serial.println("OTA: pas de mise à jour (distante <= locale).");
     return;
   }
 
-  Serial.println("✅ Nouvelle version détectée, lancement OTA...");
+  Serial.println("✅ Nouvelle version STRICTEMENT supérieure détectée, lancement OTA...");
   Serial.print("URL firmware: ");
   Serial.println(fwUrl);
 
@@ -353,6 +410,7 @@ void checkForOTAUpdate() {
   ESP.restart();
 }
 
+
 // =====================================================
 // === TF-LUNA                                       ===
 // =====================================================
@@ -367,6 +425,7 @@ void processFrame(uint8_t *buf) {
   int dist = buf[2] + (buf[3] << 8);
   lastDistance = dist;
 }
+
 
 // =====================================================
 // === CALCUL DU VOLUME                               ===
@@ -405,6 +464,7 @@ String buildStatusString(int distance, float &volumeCuveHL, float &capaciteCuveH
   return String(buf);
 }
 
+
 // =====================================================
 // === SETUP                                          ===
 // =====================================================
@@ -426,13 +486,12 @@ void setup() {
   Serial.print("ID capteur matériel : ");
   Serial.println(idCapteur);
 
-  // IMPORTANT : nomCuve doit être vide au démarrage
   nomCuve = "";
 
   // UART TF-Luna
   tfSerial.begin(115200, SERIAL_8N1, 16, 17);
 
-  // ✅ v1.1.9 : Désynchronisation au démarrage (anti tempête Freebox)
+  // Désynchronisation au démarrage (anti tempête Freebox)
   randomSeed((unsigned long)ESP.getEfuseMac());
   unsigned long startDelay = random(0UL, START_DELAY_MAX_MS + 1UL);
   Serial.print("⏳ Délai de démarrage aléatoire: ");
@@ -446,14 +505,14 @@ void setup() {
   // Config serveur
   checkConfigUpdate();
 
-  // OTA au démarrage
+  // OTA au démarrage (mais uniquement si distante > locale)
   checkForOTAUpdate();
 
   // Timers
   lastNotifyMillis = millis();
   lastConfigCheck  = millis();
-  //lastOtaCheck     = millis(); mise à jour OTA seulement au démarrage
 }
+
 
 // =====================================================
 // === LOOP                                           ===
@@ -484,7 +543,7 @@ void loop() {
 
   // --- Envoi périodique ---
   if (now - lastNotifyMillis >= intervalMs) {
-    // ✅ v1.1.9 : petit jitter après chaque cycle d’envoi (anti re-synchro)
+    // petit jitter après chaque cycle d’envoi (anti re-synchro)
     lastNotifyMillis = now + random(0UL, SEND_JITTER_MAX_MS + 1UL);
 
     if (lastDistance > 0) {
@@ -497,7 +556,7 @@ void loop() {
 
       int rssi = WiFi.RSSI();
 
-      // JSON attendu par api_cuve.php (+ fw optionnel)
+      // JSON attendu par api_cuve.php (+ fw)
       String json = String("{\"id\":\"") + idCapteur +
                     "\",\"cuve\":\"" + nomCuve +
                     "\",\"distance\":" + String(lastDistance) +
@@ -522,12 +581,6 @@ void loop() {
     lastConfigCheck = now;
     checkConfigUpdate();
   }
-
-  // --- Vérifie OTA toutes les x minutes --- mise à jour OTA seulement au démarrage
-  //if (now - lastOtaCheck >= otaCheckInterval) {
-  //  lastOtaCheck = now;
-  //  checkForOTAUpdate();
-  //}
 
   // --- WATCHDOG : si plus d'envoi réussi pendant 5 minutes ---
   if (millis() - lastSuccessfulSend > sendWatchdogDelay) {
