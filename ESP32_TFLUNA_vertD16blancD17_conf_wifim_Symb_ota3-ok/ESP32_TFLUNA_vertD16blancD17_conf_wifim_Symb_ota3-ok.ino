@@ -1,11 +1,29 @@
 /* ESP32 + TF-Luna (UART2 D16 RX / D17 TX)
-   Firmware ESP32 — Capteur cuve — v1.2.3
+   Firmware ESP32 — Capteur cuve — v1.3.0
 
-   Objectif version :
+   Changements v1.3.0 :
+   - SIMPLIFICATION : le calcul du volume/%/hauteurs est desormais fait
+     cote serveur (interpretCuve() dans cuves_lib.php) - le firmware
+     n'envoie plus que la distance brute. Suppression de buildStatusString()
+     et du polling de config toutes les 60s (checkConfigUpdate()), devenu
+     inutile (plus rien a en tirer cote firmware).
+   - CLE API : premiere inscription automatique aupres de /cuves/register.php
+     avec un secret partage grave dans le firmware, cle recue stockee en
+     NVS (Preferences) et reutilisee a chaque redemarrage - envoyee dans
+     l'en-tete X-Api-Key de chaque requete.
+   - CERTIFICAT HTTPS : les connexions verifient desormais le certificat
+     du serveur (ISRG Root X1, verifie empiriquement contre la chaine
+     reelle du serveur le 20/09/2026) au lieu de client.setInsecure().
+     Necessite une synchronisation d'horloge (NTP) prealable. IMPORTANT :
+     si la synchro NTP ou la validation echoue, repli automatique en mode
+     non verifie (comme avant) plutot que de rester muet - priorite
+     absolue a ne jamais perdre la capacite de recevoir un correctif OTA
+     a distance (capteurs au plafond, difficiles d'acces).
+
+   Objectif version (historique v1.2.3) :
    - Désynchronisation AU DÉMARRAGE (anti tempête Freebox / DHCP / TLS)
    - Wi-Fi plus stable (auto-reconnect + pas d’écriture flash)
    - Petit jitter sur les ENVOIS uniquement (évite re-synchronisation dans le temps)
-   - OTA / Config : inchangés dans leur logique
    - FIX IMPORTANT : OTA uniquement si version distante STRICTEMENT supérieure à la version locale
 */
 
@@ -16,39 +34,88 @@
 #include <WiFiManager.h>  // https://github.com/tzapu/WiFiManager
 #include <HTTPClient.h>
 #include <Update.h>
+#include <Preferences.h>
+#include <time.h>
+#include "secrets.h" // definit CUVE_PROVISIONING_SECRET - jamais commite (voir .gitignore + secrets.h.example)
 
 // --- WiFiManager global ---
 WiFiManager wm;
+
+// --- Stockage persistant (cle API) ---
+Preferences prefs;
 
 // --- Identifiant matériel unique ---
 String idCapteurStr;
 const char* idCapteur = nullptr;
 
 // --- VERSION FIRMWARE ---
-const char* FIRMWARE_VERSION = "1.2.3";
+const char* FIRMWARE_VERSION = "1.3.0";
 
 // --- SERVEUR ---
 const char* server    = "prod.lamothe-despujols.com";
 const int   httpsPort = 443;
 
-// --- CHEMINS OTA ---
-const char* otaCheckPath = "/cuves/ota_check.php"; // renvoie JSON version + url
+// --- CHEMINS SERVEUR ---
+const char* otaCheckPath  = "/cuves/ota_check.php";  // renvoie JSON version + url
+const char* registerPath  = "/cuves/register.php";   // premiere inscription -> cle API
+
+// --- CLE API (obtenue une fois via registerPath, puis stockee en NVS) ---
+// CUVE_PROVISIONING_SECRET vient de secrets.h (non commite) - secret
+// PARTAGE par toute l'installation (pas par capteur), grave a la
+// compilation - n'autorise que la toute premiere inscription d'un
+// capteur. Doit correspondre EXACTEMENT a la valeur cote serveur
+// (cuves/secrets.local.php).
+String apiKey = ""; // vide tant que non inscrit
+
+// --- Certificat racine (Let's Encrypt ISRG Root X1, valide jusqu'en 2035) ---
+// Recupere le 20/09/2026 depuis https://letsencrypt.org/certs/isrgrootx1.pem
+// et verifie empiriquement contre la chaine reelle servie par le serveur
+// (openssl verify -CAfile isrgrootx1.pem ... -> OK).
+const char* ISRG_ROOT_X1 = R"CERT(-----BEGIN CERTIFICATE-----
+MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAw
+TzELMAkGA1UEBhMCVVMxKTAnBgNVBAoTIEludGVybmV0IFNlY3VyaXR5IFJlc2Vh
+cmNoIEdyb3VwMRUwEwYDVQQDEwxJU1JHIFJvb3QgWDEwHhcNMTUwNjA0MTEwNDM4
+WhcNMzUwNjA0MTEwNDM4WjBPMQswCQYDVQQGEwJVUzEpMCcGA1UEChMgSW50ZXJu
+ZXQgU2VjdXJpdHkgUmVzZWFyY2ggR3JvdXAxFTATBgNVBAMTDElTUkcgUm9vdCBY
+MTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCCAgoCggIBAK3oJHP0FDfzm54rVygc
+h77ct984kIxuPOZXoHj3dcKi/vVqbvYATyjb3miGbESTtrFj/RQSa78f0uoxmyF+
+0TM8ukj13Xnfs7j/EvEhmkvBioZxaUpmZmyPfjxwv60pIgbz5MDmgK7iS4+3mX6U
+A5/TR5d8mUgjU+g4rk8Kb4Mu0UlXjIB0ttov0DiNewNwIRt18jA8+o+u3dpjq+sW
+T8KOEUt+zwvo/7V3LvSye0rgTBIlDHCNAymg4VMk7BPZ7hm/ELNKjD+Jo2FR3qyH
+B5T0Y3HsLuJvW5iB4YlcNHlsdu87kGJ55tukmi8mxdAQ4Q7e2RCOFvu396j3x+UC
+B5iPNgiV5+I3lg02dZ77DnKxHZu8A/lJBdiB3QW0KtZB6awBdpUKD9jf1b0SHzUv
+KBds0pjBqAlkd25HN7rOrFleaJ1/ctaJxQZBKT5ZPt0m9STJEadao0xAH0ahmbWn
+OlFuhjuefXKnEgV4We0+UXgVCwOPjdAvBbI+e0ocS3MFEvzG6uBQE3xDk3SzynTn
+jh8BCNAw1FtxNrQHusEwMFxIt4I7mKZ9YIqioymCzLq9gwQbooMDQaHWBfEbwrbw
+qHyGO0aoSCqI3Haadr8faqU9GY/rOPNk3sgrDQoo//fb4hVC1CLQJ13hef4Y53CI
+rU7m2Ys6xt0nUW7/vGT1M0NPAgMBAAGjQjBAMA4GA1UdDwEB/wQEAwIBBjAPBgNV
+HRMBAf8EBTADAQH/MB0GA1UdDgQWBBR5tFnme7bl5AFzgAiIyBpY9umbbjANBgkq
+hkiG9w0BAQsFAAOCAgEAVR9YqbyyqFDQDLHYGmkgJykIrGF1XIpu+ILlaS/V9lZL
+ubhzEFnTIZd+50xx+7LSYK05qAvqFyFWhfFQDlnrzuBZ6brJFe+GnY+EgPbk6ZGQ
+3BebYhtF8GaV0nxvwuo77x/Py9auJ/GpsMiu/X1+mvoiBOv/2X/qkSsisRcOj/KK
+NFtY2PwByVS5uCbMiogziUwthDyC3+6WVwW6LLv3xLfHTjuCvjHIInNzktHCgKQ5
+ORAzI4JMPJ+GslWYHb4phowim57iaztXOoJwTdwJx4nLCgdNbOhdjsnvzqvHu7Ur
+TkXWStAmzOVyyghqpZXjFaH3pO3JLF+l+/+sKAIuvtd7u+Nxe5AW0wdeRlN8NwdC
+jNPElpzVmbUq4JUagEiuTDkHzsxHpFKVK7q4+63SM1N95R1NbdWhscdCb+ZAJzVc
+oyi3B43njTOQ5yOf+1CceWxG1bQVs5ZufpsMljq4Ui0/1lvh+wjChP4kqKOJ2qxq
+4RgqsahDYVvTH9w7jXbyLeiNdd8XM2w9U/t7y0Ff/9yi0GE44Za4rF2LN9d11TPA
+mRGunUHBcnWEvgJBQl9nJEiU0Zsnvgc/ubhPgXRR4Xq37Z0j4r7g1SgEEzwxA57d
+emyPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc=
+-----END CERTIFICATE-----
+)CERT";
+
+// --- Etat NTP (voir syncTimeNTP() / connectSecure()) ---
+bool timeIsSynced = false;
 
 // --- BROCHE DU BOUTON BOOT ---
 #define BOOT_PIN 0  // sur ESP32 classique, bouton BOOT = GPIO0
 
 // --- VARIABLES DE CUVE ---
 String nomCuve = "";   // pas de valeur par défaut
-float hauteurCapteurFond = 200.0;
-float hauteurMaxLiquide  = 50.0;
-float diametreCuve       = 70.0;
-float AjustementHL       = 0.00;
 
 // --- TEMPO ---
 unsigned long lastNotifyMillis   = 0;
 const unsigned long intervalMs   = 8000UL; // mesure luna toutes les 8 secondes
-unsigned long lastConfigCheck    = 0;
-const unsigned long configCheckInterval = 60000UL;
 
 // --- OTA TEMPO --- mise à jour OTA seulement au démarrage.
 //unsigned long lastOtaCheck       = 0;
@@ -119,6 +186,51 @@ int compareSemver3(const String& vA, const String& vB) {
 
 
 // =====================================================
+// === HEURE (NTP) + CONNEXION HTTPS AVEC REPLI      ===
+// =====================================================
+
+// La validation de certificat exige une horloge a peu pres juste (sinon
+// le certificat parait "pas encore valide"/"expire"). Tentative courte
+// (10s max) - si ca echoue, timeIsSynced reste false et connectSecure()
+// se rabat sur le mode non verifie (voir plus bas).
+bool syncTimeNTP() {
+  configTime(0, 0, "pool.ntp.org", "time.google.com");
+
+  time_t now = time(nullptr);
+  unsigned long start = millis();
+  const unsigned long NTP_TIMEOUT_MS = 10000UL;
+  const time_t SANE_EPOCH_MIN = 1700000000; // ~nov. 2023, largement avant toute utilisation reelle
+
+  while (now < SANE_EPOCH_MIN && millis() - start < NTP_TIMEOUT_MS) {
+    delay(200);
+    now = time(nullptr);
+  }
+
+  return now >= SANE_EPOCH_MIN;
+}
+
+// Etablit la connexion HTTPS vers le serveur. Verifie le certificat si
+// l'heure est synchronisee ; sinon (ou si la tentative verifiee echoue),
+// se replie automatiquement sur un mode non verifie plutot que de rester
+// muet - priorite absolue a ne jamais perdre la capacite d'envoyer des
+// mesures ou de recevoir un correctif OTA (capteurs au plafond).
+bool connectSecure(WiFiClientSecure &client) {
+  if (timeIsSynced) {
+    client.setCACert(ISRG_ROOT_X1);
+    if (client.connect(server, httpsPort)) {
+      return true;
+    }
+    client.stop();
+    Serial.println("⚠️ Connexion vérifiée (certificat) échouée, repli en mode non vérifié.");
+  } else {
+    Serial.println("⚠️ Heure non synchronisée (NTP), connexion en mode non vérifié.");
+  }
+  client.setInsecure();
+  return client.connect(server, httpsPort);
+}
+
+
+// =====================================================
 // === CONNEXION WIFI + WiFiManager ROBUSTE          ===
 // =====================================================
 void setupWiFi() {
@@ -173,6 +285,11 @@ void setupWiFi() {
   Serial.print("Version firmware actuelle : ");
   Serial.println(FIRMWARE_VERSION);
 
+  timeIsSynced = syncTimeNTP();
+  Serial.println(timeIsSynced
+    ? "✅ Heure synchronisée (NTP) - connexions HTTPS vérifiées."
+    : "⚠️ Échec synchro NTP - connexions HTTPS en mode non vérifié pour cette session.");
+
   lastSuccessfulSend = millis();
 }
 
@@ -187,9 +304,7 @@ bool sendDataToServer(const String &jsonPayload) {
   }
 
   WiFiClientSecure client;
-  client.setInsecure();
-
-  if (!client.connect(server, httpsPort)) {
+  if (!connectSecure(client)) {
     Serial.println("⚠️ Connexion HTTPS échouée (send)");
     return false;
   }
@@ -198,6 +313,9 @@ bool sendDataToServer(const String &jsonPayload) {
   client.println("POST " + url + " HTTP/1.1");
   client.println("Host: " + String(server));
   client.println("Content-Type: application/json");
+  if (apiKey.length() > 0) {
+    client.println("X-Api-Key: " + apiKey);
+  }
   client.print("Content-Length: ");
   client.println(jsonPayload.length());
   client.println("Connection: close");
@@ -218,21 +336,33 @@ bool sendDataToServer(const String &jsonPayload) {
 
 
 // =====================================================
-// === RÉCUPÉRATION CONFIG SERVEUR                  ===
+// === INSCRIPTION (clé API) — une seule fois          ===
 // =====================================================
-void checkConfigUpdate() {
+// Appelée uniquement si aucune clé n'est encore en NVS (voir setup()).
+// Envoie le secret partagé de l'installation ; si accepté, stocke la
+// clé propre à ce capteur en NVS (persistante) pour les prochains
+// redémarrages - registerPath n'est alors plus jamais rappelé.
+void registerWithServer() {
   if (WiFi.status() != WL_CONNECTED) return;
 
+  String json = String("{\"id\":\"") + idCapteur +
+                "\",\"cuve\":\"" + nomCuve +
+                "\",\"secret\":\"" + CUVE_PROVISIONING_SECRET + "\"}";
+
   WiFiClientSecure client;
-  client.setInsecure();
+  if (!connectSecure(client)) {
+    Serial.println("⚠️ Inscription: connexion HTTPS échouée");
+    return;
+  }
 
-  if (!client.connect(server, httpsPort)) return;
-
-  String url = "/cuves/get_config.php?id=" + String(idCapteur);
-  client.println("GET " + url + " HTTP/1.1");
+  client.println(String("POST ") + registerPath + " HTTP/1.1");
   client.println("Host: " + String(server));
+  client.println("Content-Type: application/json");
+  client.print("Content-Length: ");
+  client.println(json.length());
   client.println("Connection: close");
   client.println();
+  client.print(json);
 
   String payload;
   while (client.connected()) {
@@ -244,25 +374,30 @@ void checkConfigUpdate() {
 
   int start = payload.indexOf('{');
   int end   = payload.lastIndexOf('}');
-  if (start < 0 || end <= start) return;
-
-  String jsonStr = payload.substring(start, end + 1);
-
-  StaticJsonDocument<512> doc;
-  if (deserializeJson(doc, jsonStr)) return;
-
-  if (doc.containsKey("error")) {
-    Serial.println("Config serveur absente → valeurs par défaut conservées.");
+  if (start < 0 || end <= start) {
+    Serial.println("⚠️ Inscription: réponse inattendue");
     return;
   }
 
-  nomCuve            = doc["nomCuve"].as<String>();
-  hauteurCapteurFond = doc["hauteurCapteurFond"].as<float>();
-  hauteurMaxLiquide  = doc["hauteurMaxLiquide"].as<float>();
-  diametreCuve       = doc["diametreCuve"].as<float>();
-  AjustementHL       = doc["AjustementHL"].as<float>();
+  String jsonStr = payload.substring(start, end + 1);
+  StaticJsonDocument<256> doc;
+  if (deserializeJson(doc, jsonStr)) {
+    Serial.println("⚠️ Inscription: erreur parsing JSON");
+    return;
+  }
 
-  Serial.println("Config appliquée depuis serveur.");
+  const char* receivedKey = doc["api_key"] | "";
+  if (strlen(receivedKey) == 0) {
+    Serial.println("⚠️ Inscription refusée (secret invalide ?)");
+    return;
+  }
+
+  apiKey = String(receivedKey);
+  prefs.begin("cuve", false);
+  prefs.putString("api_key", apiKey);
+  prefs.end();
+
+  Serial.println("✅ Inscription réussie, clé API obtenue et enregistrée.");
 }
 
 
@@ -279,9 +414,7 @@ void checkForOTAUpdate() {
 
   // 1) Récupérer JSON de ota_check.php
   WiFiClientSecure client;
-  client.setInsecure();
-
-  if (!client.connect(server, httpsPort)) {
+  if (!connectSecure(client)) {
     Serial.println("⚠️ OTA: connexion HTTPS échouée (ota_check)");
     return;
   }
@@ -350,9 +483,19 @@ void checkForOTAUpdate() {
   Serial.println(fwUrl);
 
   // 2) Téléchargement et flash
+  // HTTPClient gère lui-même connect()/deconnect() - le repli "vérifié
+  // puis non vérifié" est donc fait en 2 tentatives explicites ici
+  // plutôt que via connectSecure() (pensé pour un WiFiClientSecure
+  // utilisé directement). Même logique/priorité : ne jamais rester
+  // bloqué sans pouvoir récupérer un correctif OTA.
   HTTPClient https;
   WiFiClientSecure fwClient;
-  fwClient.setInsecure();
+  bool fwVerified = timeIsSynced;
+  if (fwVerified) {
+    fwClient.setCACert(ISRG_ROOT_X1);
+  } else {
+    fwClient.setInsecure();
+  }
 
   if (!https.begin(fwClient, fwUrl)) {
     Serial.println("⚠️ OTA: impossible d'initialiser la requête HTTP");
@@ -360,6 +503,19 @@ void checkForOTAUpdate() {
   }
 
   int httpCode = https.GET();
+
+  if (httpCode <= 0 && fwVerified) {
+    Serial.println("⚠️ OTA: échec en mode vérifié, nouvelle tentative en mode non vérifié...");
+    https.end();
+    fwClient.stop();
+    fwClient.setInsecure();
+    if (!https.begin(fwClient, fwUrl)) {
+      Serial.println("⚠️ OTA: impossible d'initialiser la requête HTTP (repli)");
+      return;
+    }
+    httpCode = https.GET();
+  }
+
   if (httpCode != HTTP_CODE_OK) {
     Serial.print("⚠️ OTA: code HTTP inattendu: ");
     Serial.println(httpCode);
@@ -428,44 +584,6 @@ void processFrame(uint8_t *buf) {
 
 
 // =====================================================
-// === CALCUL DU VOLUME                               ===
-// =====================================================
-String buildStatusString(int distance, float &volumeCuveHL, float &capaciteCuveHL,
-                         float &pourcentage, float &hauteurPlein, float &hauteurCuve) {
-
-  hauteurCuve = hauteurCapteurFond - hauteurMaxLiquide;
-  if (hauteurCuve <= 0) hauteurCuve = 1.0;
-
-  hauteurPlein = hauteurCuve - (distance - hauteurMaxLiquide);
-  if (hauteurPlein < 0) hauteurPlein = 0;
-  if (hauteurPlein > hauteurCuve) hauteurPlein = hauteurCuve;
-
-  pourcentage = (hauteurPlein / hauteurCuve) * 100.0;
-  capaciteCuveHL = (3.14159265 * pow((diametreCuve / 2.0), 2) * hauteurCuve) / 100000.0;
-  volumeCuveHL = (pourcentage / 100.0) * capaciteCuveHL + AjustementHL;
-
-  if (isnan(pourcentage)) pourcentage = 0;
-  if (isnan(capaciteCuveHL)) capaciteCuveHL = 0;
-  if (isnan(volumeCuveHL)) volumeCuveHL = 0;
-
-  char buf[200];
-  snprintf(buf, sizeof(buf),
-           "%s | Distance: %d cm | %.2f%% | %.2f / %.2f HL (+%.2f HL) | %.1f / %.1f cm | RSSI: %d dBm",
-           nomCuve.c_str(),
-           distance,
-           pourcentage,
-           volumeCuveHL,
-           capaciteCuveHL,
-           AjustementHL,
-           hauteurPlein,
-           hauteurCuve,
-           WiFi.RSSI());
-
-  return String(buf);
-}
-
-
-// =====================================================
 // === SETUP                                          ===
 // =====================================================
 void setup() {
@@ -499,18 +617,27 @@ void setup() {
   Serial.println(" ms");
   delay(startDelay);
 
-  // Wi-Fi
+  // Wi-Fi (+ synchro NTP, voir setupWiFi())
   setupWiFi();
 
-  // Config serveur
-  checkConfigUpdate();
+  // Clé API : chargée depuis la NVS si déjà inscrit, sinon inscription
+  // une seule fois auprès du serveur (voir registerWithServer()).
+  prefs.begin("cuve", true); // lecture seule
+  apiKey = prefs.getString("api_key", "");
+  prefs.end();
+
+  if (apiKey.length() == 0) {
+    Serial.println("🔑 Aucune clé API en mémoire, inscription auprès du serveur...");
+    registerWithServer();
+  } else {
+    Serial.println("🔑 Clé API déjà enregistrée (NVS).");
+  }
 
   // OTA au démarrage (mais uniquement si distante > locale)
   checkForOTAUpdate();
 
   // Timers
   lastNotifyMillis = millis();
-  lastConfigCheck  = millis();
 }
 
 
@@ -547,25 +674,17 @@ void loop() {
     lastNotifyMillis = now + random(0UL, SEND_JITTER_MAX_MS + 1UL);
 
     if (lastDistance > 0) {
-      float volumeCuveHL, capaciteCuveHL, pourcentage, hauteurPlein, hauteurCuve;
-      String payloadText = buildStatusString(lastDistance, volumeCuveHL,
-                                             capaciteCuveHL, pourcentage,
-                                             hauteurPlein, hauteurCuve);
-
-      Serial.println(payloadText);
-
       int rssi = WiFi.RSSI();
 
-      // JSON attendu par api_cuve.php (+ fw)
+      Serial.printf("%s | Distance: %d cm | RSSI: %d dBm\n",
+                    nomCuve.c_str(), lastDistance, rssi);
+
+      // Payload minimal : le calcul volume/%/hauteurs se fait desormais
+      // cote serveur (interpretCuve() dans cuves_lib.php) a partir de la
+      // seule distance brute.
       String json = String("{\"id\":\"") + idCapteur +
                     "\",\"cuve\":\"" + nomCuve +
                     "\",\"distance\":" + String(lastDistance) +
-                    ",\"volume\":" + String(volumeCuveHL, 2) +
-                    ",\"capacite\":" + String(capaciteCuveHL, 2) +
-                    ",\"pourcentage\":" + String(pourcentage, 2) +
-                    ",\"hauteurPlein\":" + String(hauteurPlein, 1) +
-                    ",\"hauteurCuve\":" + String(hauteurCuve, 1) +
-                    ",\"correction\":" + String(AjustementHL, 2) +
                     ",\"rssi\":" + String(rssi) +
                     ",\"fw\":\"" + String(FIRMWARE_VERSION) + "\"}";
 
@@ -573,13 +692,16 @@ void loop() {
       if (ok) {
         lastSuccessfulSend = now;
       }
-    }
-  }
 
-  // --- Vérifie la config toutes les 60 secondes ---
-  if (now - lastConfigCheck >= configCheckInterval) {
-    lastConfigCheck = now;
-    checkConfigUpdate();
+      // Si l'inscription initiale a echoue (WiFi capricieux au tout
+      // premier boot, etc.), on retente ici tant qu'aucune cle n'est
+      // obtenue - sans bloquer l'envoi des mesures pour autant (qui
+      // fonctionne deja sans cle pendant la transition, voir
+      // isValidCuveApiKey() cote serveur).
+      if (apiKey.length() == 0) {
+        registerWithServer();
+      }
+    }
   }
 
   // --- WATCHDOG : si plus d'envoi réussi pendant 5 minutes ---
