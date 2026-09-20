@@ -1,5 +1,12 @@
 /* ESP32 + TF-Luna (UART2 D16 RX / D17 TX)
-   Firmware ESP32 — Capteur cuve — v1.3.0
+   Firmware ESP32 — Capteur cuve — v1.3.1
+
+   Changements v1.3.1 (TEST, a confirmer sur le terrain) :
+   - Petit delai (300ms) ajoute juste apres WiFi.mode(WIFI_STA), avant
+     la tentative de connexion - piste pour expliquer un rejet rapide
+     observe au boot ("wifi:Association refused too many times, max
+     allowed 1"). Si ca ne resout pas le probleme, a retirer en 1.3.2
+     (strictement identique au 1.3.0 sinon).
 
    Changements v1.3.0 :
    - SIMPLIFICATION : le calcul du volume/%/hauteurs est desormais fait
@@ -49,7 +56,7 @@ String idCapteurStr;
 const char* idCapteur = nullptr;
 
 // --- VERSION FIRMWARE ---
-const char* FIRMWARE_VERSION = "1.3.0";
+const char* FIRMWARE_VERSION = "1.3.1";
 
 // --- SERVEUR ---
 const char* server    = "prod.lamothe-despujols.com";
@@ -260,6 +267,15 @@ void setupWiFi() {
   // Wi-Fi plus stable / évite écritures flash inutiles
   WiFi.setAutoReconnect(true);
   WiFi.persistent(false);
+
+  // v1.3.1 - TEST : petit delai pour laisser la puce radio finir de
+  // s'initialiser/se stabiliser juste apres WiFi.mode(), avant de tenter
+  // une connexion. Piste pour expliquer "wifi:Association refused too
+  // many times, max allowed 1" observe au boot (le code tente la
+  // connexion plus vite que ce que la puce peut encaisser) - hypothese a
+  // valider sur le terrain, pas une certitude. Si ca n'aide pas, a
+  // retirer en 1.3.2 (identique au 1.3.0 sinon).
+  delay(300);
 
   bool connected = false;
 
